@@ -21,10 +21,41 @@ struct MessagePair {
     std::chrono::steady_clock::time_point arrival_time;
 };
 
+class ResultSender {
+   public:
+    ResultSender(boost::asio::io_context& io_context, const std::string& host,
+                 unsigned short port)
+        : socket(io_context, udp::endpoint(udp::v4(), 0)),
+          endpoint(boost::asio::ip::make_address(host), port) {}
+
+    void send_result(std::int64_t time, double aggregated_lat,
+                     double aggregated_lon) {
+        json j;
+        j["time"] = time;
+        j["lat"] = aggregated_lat;
+        j["lon"] = aggregated_lon;
+        std::string msg = j.dump();
+        boost::system::error_code ec;
+        socket.send_to(boost::asio::buffer(msg), endpoint, 0, ec);
+
+        if (ec) {
+            std::cerr << "Error when send UDP: " << ec.message() << std::endl;
+        } else {
+            std::cout << "Sent to QGIS: " << msg << std::endl;
+        }
+    }
+
+   private:
+    udp::socket socket;
+    udp::endpoint endpoint;
+};
+
+
 class Aggregator {
    public:
-    Aggregator(boost::asio::io_context& io_context)
-        : timer(io_context, std::chrono::minutes(1)) {
+    Aggregator(boost::asio::io_context& io_context,
+               ResultSender* sender = nullptr)
+        : timer(io_context, std::chrono::minutes(1)), result_sender(sender) {
         start_cleanup();
     }
 
@@ -57,6 +88,12 @@ class Aggregator {
             std::cout << "Time: " << time
                       << " Aggregated lat: " << aggregated_lat
                       << ", Aggregated lon: " << aggregated_lon << std::endl;
+
+            if (result_sender) {
+                result_sender->send_result(time, aggregated_lat,
+                                           aggregated_lon);
+            }
+
             buffer.erase(time);
         }
     }
@@ -78,8 +115,8 @@ class Aggregator {
             auto duration = std::chrono::duration_cast<std::chrono::minutes>(
                 now - it->second.arrival_time);
             if (duration.count() >= 1) {
-                std::cout << "Очищаем неподходящее сообщение с time: "
-                          << it->first << std::endl;
+                std::cout << "Clean up message with time: " << it->first
+                          << std::endl;
                 it = buffer.erase(it);
             } else {
                 ++it;
@@ -89,6 +126,7 @@ class Aggregator {
 
     std::unordered_map<std::int64_t, MessagePair> buffer;
     boost::asio::steady_timer timer;
+    ResultSender* result_sender;
 };
 
 class UdpReceiver {
@@ -157,7 +195,8 @@ class UdpReceiver {
 int main() {
     try {
         boost::asio::io_context io_context;
-        Aggregator aggregator(io_context);
+        ResultSender result_sender(io_context, "127.0.0.1", 9100);
+        Aggregator aggregator(io_context, &result_sender);
 
         UdpReceiver base(io_context, 12345, aggregator);
         UdpReceiver receiver(io_context, 12346, aggregator);
