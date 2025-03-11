@@ -32,7 +32,7 @@ def update():
             pr.addFeatures([point])
             layer.updateExtents()
             layer.triggerRepaint()
-            print(f"Добавлена точка: {lat}, {lon}")
+            print(f"Point: {lat}, {lon}")
     except socket.error:
         pass
 
@@ -40,4 +40,4 @@ timer = QTimer()
 timer.timeout.connect(update)
 timer.start(100)
 
-print("Прослушивание UDP-порт 9100 запущено. Ожидаем сообщений...")
+print("UDP was started...")

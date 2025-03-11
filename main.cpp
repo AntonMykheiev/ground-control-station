@@ -2,7 +2,9 @@
 #include <boost/asio.hpp>
 #include <boost/bind/bind.hpp>
 #include <chrono>
+#include <cmath>
 #include <cstdint>
+#include <iomanip>
 #include <iostream>
 #include <nlohmann/json.hpp>
 #include <string>
@@ -10,6 +12,10 @@
 
 using boost::asio::ip::udp;
 using json = nlohmann::json;
+
+bool is_first_measurement = true;
+double smoothed_lat = 0.0;
+double smoothed_lon = 0.0;
 
 struct MessagePair {
     bool has_rover = false;
@@ -50,7 +56,6 @@ class ResultSender {
     udp::endpoint endpoint;
 };
 
-
 class Aggregator {
    public:
     Aggregator(boost::asio::io_context& io_context,
@@ -83,11 +88,29 @@ class Aggregator {
         }
 
         if (entry.has_rover && entry.has_base) {
-            double aggregated_lat = entry.rover_lat + entry.base_lat_error;
-            double aggregated_lon = entry.rover_lon + entry.base_lon_error;
-            std::cout << "Time: " << time
-                      << " Aggregated lat: " << aggregated_lat
-                      << ", Aggregated lon: " << aggregated_lon << std::endl;
+            const double alpha = 0.1;
+
+            double aggregated_lat = entry.rover_lat - entry.base_lat_error;
+            double aggregated_lon = entry.rover_lon - entry.base_lon_error;
+
+            if (is_first_measurement) {
+                smoothed_lat = aggregated_lat;
+                smoothed_lon = aggregated_lon;
+                is_first_measurement = false;
+            } else {
+                smoothed_lat =
+                    alpha * aggregated_lat + (1 - alpha) * smoothed_lat;
+                smoothed_lon =
+                    alpha * aggregated_lon + (1 - alpha) * smoothed_lon;
+            }
+
+            aggregated_lat = std::round(aggregated_lat * 1e8) / 1e8;
+            aggregated_lon = std::round(aggregated_lon * 1e8) / 1e8;
+
+            std::cout << "Time: " << time << " Aggregated lat: " << std::fixed
+                      << std::setprecision(8) << aggregated_lat
+                      << ", Aggregated lon: " << std::fixed
+                      << std::setprecision(8) << aggregated_lon << std::endl;
 
             if (result_sender) {
                 result_sender->send_result(time, aggregated_lat,
