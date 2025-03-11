@@ -56,6 +56,83 @@ class ResultSender {
     udp::endpoint endpoint;
 };
 
+class KalmanFilter {
+   public:
+    KalmanFilter() : is_initialized(false) { P = {{{1.0, 0.0}, {0.0, 1.0}}}; }
+
+    void initialize(double lat, double lon) {
+        state = {lat, lon};
+        is_initialized = true;
+    }
+
+    void update(double measured_lat, double measured_lon, double R_lat,
+                double R_lon) {
+        if (!is_initialized) {
+            initialize(measured_lat, measured_lon);
+            return;
+        }
+
+        std::array<double, 2> z = {measured_lat, measured_lon};
+        std::array<std::array<double, 2>, 2> R = {
+            {{R_lat * R_lat, 0.0}, {0.0, R_lon * R_lon}}};
+
+        std::array<double, 2> y = {z[0] - state[0], z[1] - state[1]};
+
+        std::array<std::array<double, 2>, 2> S = {
+            {{P[0][0] + R[0][0], P[0][1] + R[0][1]},
+             {P[1][0] + R[1][0], P[1][1] + R[1][1]}}};
+
+        double innovation_norm = std::sqrt(y[0] * y[0] + y[1] * y[1]);
+        double S_trace = S[0][0] + S[1][1];
+        double threshold = 3.0 * std::sqrt(S_trace);
+        if (innovation_norm > threshold) {
+            std::cerr << "Measurement rejected as outlier: innovation norm = "
+                      << innovation_norm << std::endl;
+            return;
+        }
+
+        double det = S[0][0] * S[1][1] - S[0][1] * S[1][0];
+        if (det == 0) {
+            std::cerr
+                << "Singular innovation covariance matrix. Update skipped."
+                << std::endl;
+            return;
+        }
+        std::array<std::array<double, 2>, 2> S_inv = {
+            {{S[1][1] / det, -S[0][1] / det}, {-S[1][0] / det, S[0][0] / det}}};
+
+        std::array<std::array<double, 2>, 2> K;
+        for (int i = 0; i < 2; ++i) {
+            for (int j = 0; j < 2; ++j) {
+                K[i][j] = P[i][0] * S_inv[0][j] + P[i][1] * S_inv[1][j];
+            }
+        }
+
+        state[0] += K[0][0] * y[0] + K[0][1] * y[1];
+        state[1] += K[1][0] * y[0] + K[1][1] * y[1];
+
+        std::array<std::array<double, 2>, 2> I = {{{1.0, 0.0}, {0.0, 1.0}}};
+        std::array<std::array<double, 2>, 2> newP;
+        for (int i = 0; i < 2; ++i) {
+            for (int j = 0; j < 2; ++j) {
+                double sum = 0.0;
+                for (int k = 0; k < 2; ++k) {
+                    sum += (I[i][k] - K[i][k]) * P[k][j];
+                }
+                newP[i][j] = sum;
+            }
+        }
+        P = newP;
+    }
+
+    std::array<double, 2> get_state() const { return state; }
+
+   private:
+    bool is_initialized;
+    std::array<double, 2> state;
+    std::array<std::array<double, 2>, 2> P;
+};
+
 class Aggregator {
    public:
     Aggregator(boost::asio::io_context& io_context,
@@ -83,38 +160,30 @@ class Aggregator {
             entry.base_lon_error = v2;
         } else {
             std::cerr << "Unknown device: " << device << std::endl;
-
             return;
         }
 
         if (entry.has_rover && entry.has_base) {
-            const double alpha = 0.1;
+            double measured_lat = entry.rover_lat - entry.base_lat_error;
+            double measured_lon = entry.rover_lon - entry.base_lon_error;
 
-            double aggregated_lat = entry.rover_lat - entry.base_lat_error;
-            double aggregated_lon = entry.rover_lon - entry.base_lon_error;
+            double rounded_lat = std::round(measured_lat * 1e8) / 1e8;
+            double rounded_lon = std::round(measured_lon * 1e8) / 1e8;
 
-            if (is_first_measurement) {
-                smoothed_lat = aggregated_lat;
-                smoothed_lon = aggregated_lon;
-                is_first_measurement = false;
-            } else {
-                smoothed_lat =
-                    alpha * aggregated_lat + (1 - alpha) * smoothed_lat;
-                smoothed_lon =
-                    alpha * aggregated_lon + (1 - alpha) * smoothed_lon;
-            }
+            double R_lat = entry.base_lat_error;
+            double R_lon = entry.base_lon_error;
 
-            aggregated_lat = std::round(aggregated_lat * 1e8) / 1e8;
-            aggregated_lon = std::round(aggregated_lon * 1e8) / 1e8;
+            kalman_filter.update(measured_lat, measured_lon, R_lat, R_lon);
 
-            std::cout << "Time: " << time << " Aggregated lat: " << std::fixed
-                      << std::setprecision(8) << aggregated_lat
-                      << ", Aggregated lon: " << std::fixed
-                      << std::setprecision(8) << aggregated_lon << std::endl;
+            auto state = kalman_filter.get_state();
+            std::cout << "Time: " << time
+                      << " Kalman filtered lat: " << std::fixed
+                      << std::setprecision(8) << state[0]
+                      << ", Kalman filtered lon: " << std::fixed
+                      << std::setprecision(8) << state[1] << std::endl;
 
             if (result_sender) {
-                result_sender->send_result(time, aggregated_lat,
-                                           aggregated_lon);
+                result_sender->send_result(time, state[0], state[1]);
             }
 
             buffer.erase(time);
@@ -138,7 +207,7 @@ class Aggregator {
             auto duration = std::chrono::duration_cast<std::chrono::minutes>(
                 now - it->second.arrival_time);
             if (duration.count() >= 1) {
-                std::cout << "Clean up message with time: " << it->first
+                std::cout << "Cleaning up message with time: " << it->first
                           << std::endl;
                 it = buffer.erase(it);
             } else {
@@ -150,6 +219,7 @@ class Aggregator {
     std::unordered_map<std::int64_t, MessagePair> buffer;
     boost::asio::steady_timer timer;
     ResultSender* result_sender;
+    KalmanFilter kalman_filter;
 };
 
 class UdpReceiver {
