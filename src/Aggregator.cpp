@@ -38,16 +38,10 @@ void Aggregator::process_message(const std::string& device, std::int64_t time,
     }
 
     if (entry.has_rover && entry.has_base) {
-        double measured_lat = entry.rover_lat - entry.base_lat_error;
-        double measured_lon = entry.rover_lon - entry.base_lon_error;
-
-        double rounded_lat = std::round(measured_lat * 1e14) / 1e14;
-        double rounded_lon = std::round(measured_lon * 1e14) / 1e14;
-
         double R_lat = entry.base_lat_error;
         double R_lon = entry.base_lon_error;
 
-        kalman_filter.update(measured_lat, measured_lon, R_lat, R_lon);
+        kalman_filter.update(entry.rover_lat, entry.rover_lon, R_lat, R_lon);
 
         auto state = kalman_filter.get_state();
         std::cout << "Time: " << time << " Kalman filtered lat: " << std::fixed

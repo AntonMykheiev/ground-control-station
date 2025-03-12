@@ -3,13 +3,27 @@
 #include <cmath>
 #include <iostream>
 
-// Constructor
-KalmanFilter::KalmanFilter() : is_initialized(false) {
-    P = {{{1.0, 0.0}, {0.0, 1.0}}};
+extern "C" {
+#define _float_t double
+#define EKF_N 4
+#define EKF_M 2
+#include "src/tinyekf.h"
 }
 
-void KalmanFilter::initialize(double lat, double lon) {
-    state = {lat, lon};
+const double dt = 1.0;
+
+KalmanFilter::KalmanFilter() : is_initialized(false) {}
+
+void KalmanFilter::initialize(double lat, double lon, double v_lat = 0.0,
+                              double v_lon = 0.0) {
+    _float_t pdiag[EKF_N] = {1e-1, 1e-1, 1e-1, 1e-1};
+    ekf_initialize(&ekf, pdiag);
+
+    ekf.x[0] = lat;
+    ekf.x[1] = lon;
+    ekf.x[2] = v_lat;
+    ekf.x[3] = v_lon;
+
     is_initialized = true;
 }
 
@@ -20,57 +34,81 @@ void KalmanFilter::update(double measured_lat, double measured_lon,
         return;
     }
 
-    std::array<double, 2> z = {measured_lat, measured_lon};
-    std::array<std::array<double, 2>, 2> R = {
-        {{R_lat * R_lat, 0.0}, {0.0, R_lon * R_lon}}};
+    _float_t fx[EKF_N];
+    fx[0] = ekf.x[0] + dt * ekf.x[2];
+    fx[1] = ekf.x[1] + dt * ekf.x[3];
+    fx[2] = ekf.x[2];
+    fx[3] = ekf.x[3];
 
-    std::array<double, 2> y = {z[0] - state[0], z[1] - state[1]};
+    _float_t F[EKF_N * EKF_N] = {0};
+    F[0] = 1;
+    F[1] = 0;
+    F[2] = dt;
+    F[3] = 0;
+    F[4] = 0;
+    F[5] = 1;
+    F[6] = 0;
+    F[7] = dt;
+    F[8] = 0;
+    F[9] = 0;
+    F[10] = 1;
+    F[11] = 0;
+    F[12] = 0;
+    F[13] = 0;
+    F[14] = 0;
+    F[15] = 1;
 
-    std::array<std::array<double, 2>, 2> S = {
-        {{P[0][0] + R[0][0], P[0][1] + R[0][1]},
-         {P[1][0] + R[1][0], P[1][1] + R[1][1]}}};
+    const double sigma_a2 = 1e-4;
+    _float_t Q_mat[EKF_N * EKF_N] = {0};
+    Q_mat[0] = sigma_a2 * (dt * dt * dt / 3);
+    Q_mat[1] = 0;
+    Q_mat[2] = sigma_a2 * (dt * dt / 2);
+    Q_mat[3] = 0;
 
-    double innovation_norm = std::sqrt(y[0] * y[0] + y[1] * y[1]);
-    double S_trace = S[0][0] + S[1][1];
-    double threshold = 3.0 * std::sqrt(S_trace);
-    if (innovation_norm > threshold) {
-        std::cerr << "Measurement rejected as outlier: innovation norm = "
-                  << innovation_norm << std::endl;
-        return;
+    Q_mat[4] = 0;
+    Q_mat[5] = sigma_a2 * (dt * dt * dt / 3);
+    Q_mat[6] = 0;
+    Q_mat[7] = sigma_a2 * (dt * dt / 2);
+
+    Q_mat[8] = sigma_a2 * (dt * dt / 2);
+    Q_mat[9] = 0;
+    Q_mat[10] = sigma_a2 * dt;
+    Q_mat[11] = 0;
+
+    Q_mat[12] = 0;
+    Q_mat[13] = sigma_a2 * (dt * dt / 2);
+    Q_mat[14] = 0;
+    Q_mat[15] = sigma_a2 * dt;
+
+    ekf_predict(&ekf, fx, F, Q_mat);
+
+    _float_t z[EKF_M] = {measured_lat, measured_lon};
+    _float_t hx[EKF_M];
+    hx[0] = ekf.x[0];
+    hx[1] = ekf.x[1];
+
+    _float_t H_mat[EKF_M * EKF_N] = {0};
+    H_mat[0] = 1;
+    H_mat[1] = 0;
+    H_mat[2] = 0;
+    H_mat[3] = 0;
+    H_mat[4] = 0;
+    H_mat[5] = 1;
+    H_mat[6] = 0;
+    H_mat[7] = 0;
+
+    _float_t R_mat[EKF_M * EKF_M] = {0};
+    R_mat[0] = R_lat * R_lat;
+    R_mat[1] = 0;
+    R_mat[2] = 0;
+    R_mat[3] = R_lon * R_lon;
+
+    bool ok = ekf_update(&ekf, z, hx, H_mat, R_mat);
+    if (!ok) {
+        std::cerr << "EKF update failed due to singular matrix." << std::endl;
     }
-
-    double det = S[0][0] * S[1][1] - S[0][1] * S[1][0];
-    if (det == 0) {
-        std::cerr << "Singular innovation covariance matrix. Update skipped."
-                  << std::endl;
-        return;
-    }
-
-    std::array<std::array<double, 2>, 2> S_inv = {
-        {{S[1][1] / det, -S[0][1] / det}, {-S[1][0] / det, S[0][0] / det}}};
-
-    std::array<std::array<double, 2>, 2> K;
-    for (int i = 0; i < 2; ++i) {
-        for (int j = 0; j < 2; ++j) {
-            K[i][j] = P[i][0] * S_inv[0][j] + P[i][1] * S_inv[1][j];
-        }
-    }
-
-    state[0] += K[0][0] * y[0] + K[0][1] * y[1];
-    state[1] += K[1][0] * y[0] + K[1][1] * y[1];
-
-    std::array<std::array<double, 2>, 2> I = {{{1.0, 0.0}, {0.0, 1.0}}};
-    std::array<std::array<double, 2>, 2> newP;
-    for (int i = 0; i < 2; ++i) {
-        for (int j = 0; j < 2; ++j) {
-            double sum = 0.0;
-            for (int k = 0; k < 2; ++k) {
-                sum += (I[i][k] - K[i][k]) * P[k][j];
-            }
-            newP[i][j] = sum;
-        }
-    }
-    P = newP;
 }
 
-std::array<double, 2> KalmanFilter::get_state() const { return state; }
+std::array<double, 4> KalmanFilter::get_state() const {
+    return {ekf.x[0], ekf.x[1], ekf.x[2], ekf.x[3]};
+}
